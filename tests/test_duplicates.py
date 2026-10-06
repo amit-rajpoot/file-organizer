@@ -2,7 +2,8 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from organizer.duplicates import duplicate_candidates, find_duplicates, first_chunk_candidates, group_by_first_chunk, group_by_hash, group_by_size
+from organizer.duplicates import duplicate_candidates, find_duplicates, first_chunk_candidates, get_content_hash, group_by_first_chunk, group_by_hash, group_by_size
+from organizer.hasher import hash_file
 from organizer.models import FileInfo
 
 
@@ -313,3 +314,252 @@ def test_find_duplicates_requires_full_hash(tmp_path: Path):
 
     assert result == []
 
+def test_group_by_hash_uses_existing_content_hash(tmp_path: Path):
+    now = datetime.now()
+
+    file_path = tmp_path / "file.txt"
+    file_path.write_bytes(b"hello world")
+
+    file = FileInfo(
+        path=file_path,
+        size=file_path.stat().st_size,
+        mtime=now,
+        ext=".txt",
+        content_hash="precomputed-hash",
+    )
+
+    with patch(
+        "organizer.duplicates.hash_file"
+    ) as mock_hash:
+        result = group_by_hash([file])
+
+    mock_hash.assert_not_called()
+
+    assert "precomputed-hash" in result
+    assert result["precomputed-hash"] == [file]
+
+def test_group_by_hash_reuses_hash_for_same_file(
+    tmp_path: Path,
+):
+    now = datetime.now()
+
+    file_path = tmp_path / "file.txt"
+    file_path.write_bytes(b"hello world")
+
+    file = FileInfo(
+        path=file_path,
+        size=file_path.stat().st_size,
+        mtime=now,
+        ext=".txt",
+    )
+    hash_cache = {}
+
+    with patch(
+    "organizer.duplicates.hash_file",
+    wraps=hash_file) as mock_hash:
+     first_result = group_by_hash([file], hash_cache)
+     second_result = group_by_hash([file], hash_cache)
+
+    assert mock_hash.call_count == 1
+
+    assert first_result == second_result
+
+def test_hash_cache_detects_changed_file(tmp_path: Path):
+    now = datetime.now()
+
+    file_path = tmp_path / "file.txt"
+    file_path.write_bytes(b"hello")
+
+    file = FileInfo(
+        path=file_path,
+        size=file_path.stat().st_size,
+        mtime=now,
+        ext=".txt",
+    )
+
+    hash_cache: dict[Path, tuple[int, float, str]] = {
+        file_path: (
+            file.size,
+            100.0,
+            "old-hash",
+        )
+    }
+
+    file_path.write_bytes(b"goodbye")
+
+    new_size = file_path.stat().st_size
+    new_mtime = file_path.stat().st_mtime
+
+    assert (
+        hash_cache[file_path][0] != new_size
+        or hash_cache[file_path][1] != new_mtime
+    )
+
+def test_group_by_hash_rehashes_when_file_changes(
+    tmp_path: Path,
+):
+    file_path = tmp_path / "file.txt"
+    file_path.write_bytes(b"hello")
+
+    now = datetime.now()
+
+    file = FileInfo(
+        path=file_path,
+        size=file_path.stat().st_size,
+        mtime=now,
+        ext=".txt",
+    )
+
+    hash_cache: dict[Path, tuple[int, float, str]] = {}
+
+    with patch(
+        "organizer.duplicates.hash_file",
+        wraps=hash_file,
+    ) as mock_hash:
+
+        # First time → hash calculate hoga
+        group_by_hash([file], hash_cache)
+
+        assert mock_hash.call_count == 1
+
+        # File ka content change
+        file_path.write_bytes(b"goodbye")
+
+        # Same path, but file change ho chuki hai
+        updated_file = FileInfo(
+            path=file_path,
+            size=file_path.stat().st_size,
+            mtime=datetime.fromtimestamp(
+                file_path.stat().st_mtime
+            ),
+            ext=".txt",
+        )
+
+        group_by_hash([updated_file], hash_cache)
+
+        # File change hui → old cache use nahi hona chahiye
+        assert mock_hash.call_count == 2
+
+def test_get_content_hash_uses_existing_content_hash(
+    tmp_path: Path,
+):
+    file_path = tmp_path / "file.txt"
+    file_path.write_bytes(b"hello")
+
+    file = FileInfo(
+        path=file_path,
+        size=file_path.stat().st_size,
+        mtime=datetime.now(),
+        ext=".txt",
+        content_hash="already-known-hash",
+    )
+
+    hash_cache: dict[Path, tuple[int, float, str]] = {}
+
+    with patch("organizer.duplicates.hash_file") as mock_hash:
+        result = get_content_hash(file, hash_cache)
+
+    assert result == "already-known-hash"
+    mock_hash.assert_not_called()
+
+def test_get_content_hash_uses_valid_cache(
+    tmp_path: Path,
+):
+    file_path = tmp_path / "file.txt"
+    file_path.write_bytes(b"hello")
+
+    size = file_path.stat().st_size
+    mtime = file_path.stat().st_mtime
+
+    file = FileInfo(
+        path=file_path,
+        size=size,
+        mtime=datetime.fromtimestamp(mtime),
+        ext=".txt",
+    )
+
+    hash_cache = {
+        file_path: (
+            size,
+            mtime,
+            "cached-hash",
+        )
+    }
+
+    with patch("organizer.duplicates.hash_file") as mock_hash:
+        result = get_content_hash(file, hash_cache)
+
+    assert result == "cached-hash"
+    mock_hash.assert_not_called()
+
+def test_get_content_hash_calculates_when_cache_missing(
+    tmp_path: Path,
+):
+    file_path = tmp_path / "file.txt"
+    file_path.write_bytes(b"hello")
+
+    file = FileInfo(
+        path=file_path,
+        size=file_path.stat().st_size,
+        mtime=datetime.now(),
+        ext=".txt",
+    )
+
+    hash_cache = {}
+
+    with patch(
+        "organizer.duplicates.hash_file",
+        return_value="new-hash",
+    ) as mock_hash:
+        result = get_content_hash(file, hash_cache)
+
+    assert result == "new-hash"
+    mock_hash.assert_called_once_with(file_path)
+
+    assert file_path in hash_cache
+    assert hash_cache[file_path][2] == "new-hash"
+
+def test_get_content_hash_rehashes_invalid_cache(
+    tmp_path: Path,
+):
+    file_path = tmp_path / "file.txt"
+    file_path.write_bytes(b"hello")
+
+    old_size = file_path.stat().st_size
+    old_mtime = file_path.stat().st_mtime
+
+    file_path.write_bytes(b"goodbye world")
+
+    new_size = file_path.stat().st_size
+    new_mtime = file_path.stat().st_mtime
+
+    file = FileInfo(
+        path=file_path,
+        size=new_size,
+        mtime=datetime.fromtimestamp(new_mtime),
+        ext=".txt",
+    )
+
+    hash_cache = {
+        file_path: (
+            old_size,
+            old_mtime,
+            "old-hash",
+        )
+    }
+
+    with patch(
+        "organizer.duplicates.hash_file",
+        return_value="new-hash",
+    ) as mock_hash:
+        result = get_content_hash(file, hash_cache)
+
+    assert result == "new-hash"
+
+    mock_hash.assert_called_once_with(file_path)
+
+    assert hash_cache[file_path] == (
+        new_size,
+        new_mtime,
+        "new-hash",
+    )

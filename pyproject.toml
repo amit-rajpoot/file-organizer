@@ -20,3 +20,8 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-name = "organizer"
+
+[dependency-groups]
+dev = [
+    "pytest-cov>=7.1.0",
+]
